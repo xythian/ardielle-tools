@@ -61,18 +61,16 @@ func GenerateGoClient(opts *generateOptions) error {
 		}()
 	}
 	if opts.requestResponse {
-		gen := &reqRepClientGenerator{
-			registry:    rdl.NewTypeRegistry(schema),
-			schema:      schema,
-			name:        capitalize(string(schema.Name)),
-			writer:      out,
-			banner:      banner,
-			prefixEnums: prefixEnums,
-			precise:     precise,
-			ns:          ns,
-			librdl:      librdl,
+		gen := &reqRepGenerator{
+			registry: rdl.NewTypeRegistry(schema),
+			schema:   schema,
+			name:     capitalize(string(schema.Name)),
+			writer:   out,
+			banner:   banner,
+			ns:       ns,
+			librdl:   librdl,
 		}
-		if err := gen.emitClient(); err != nil {
+		if err := gen.emitCode(true, false); err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: generating client code: %v\n", err)
 		}
 		out.Flush()

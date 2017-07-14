@@ -279,6 +279,12 @@ func generate(flavor string, srcFile string, opts *generateOptions) {
 		err = GenerateGoServer(opts)
 	case "go-client":
 		err = GenerateGoClient(opts)
+	case "go-rpc":
+		// Generate client and server stubs using the reqrep model
+		opts.requestResponse = true
+		if err = GenerateGoModel(opts); err == nil {
+			err = GenerateRpc(opts)
+		}
 	case "go-server-project":
 		err = GenerateGoServerProject(opts)
 	case "java-model":

@@ -6,25 +6,72 @@ import (
 	"fmt"
 	"github.com/ardielle/ardielle-go/rdl"
 	"go/format"
+	"os"
+	"path/filepath"
 	"strings"
 	"text/template"
 )
 
-type reqRepClientGenerator struct {
-	registry    rdl.TypeRegistry
-	schema      *rdl.Schema
-	name        string
-	writer      *bufio.Writer
-	err         error
-	banner      string
-	prefixEnums bool
-	precise     bool
-	ns          string
-	librdl      string
+func GenerateRpc(opts *generateOptions) error {
+	banner := opts.banner
+	schema := opts.schema
+	outdir := opts.dirName
+	ns := opts.ns
+	librdl := opts.librdl
+	name := strings.ToLower(string(schema.Name))
+	if outdir == "" {
+		outdir = "."
+		name = name + "_rpc.go"
+	} else if strings.HasSuffix(outdir, ".go") {
+		name = filepath.Base(outdir)
+		outdir = filepath.Dir(outdir)
+	} else {
+		name = name + "_rpc.go"
+	}
+	filepath := outdir + "/" + name
+	out, file, _, err := outputWriter(filepath, "", ".go")
+	if err != nil {
+		return err
+	}
+	if file != nil {
+		defer func() {
+			file.Close()
+			err := goFmt(filepath)
+			if err != nil {
+				fmt.Println("Warning: could not format go code:", err)
+			}
+		}()
+	}
+	gen := &reqRepGenerator{
+		registry: rdl.NewTypeRegistry(schema),
+		schema:   schema,
+		name:     capitalize(string(schema.Name)),
+		writer:   out,
+		banner:   banner,
+		ns:       ns,
+		librdl:   librdl,
+	}
+	if err := gen.emitCode(true, true); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: generating rpc code: %v\n", err)
+	}
+	out.Flush()
+	return gen.err
 }
 
-const rrClientTemplate = `{{header}}
+type reqRepGenerator struct {
+	registry rdl.TypeRegistry
+	schema   *rdl.Schema
+	name     string
+	writer   *bufio.Writer
+	err      error
+	banner   string
+	ns       string
+	librdl   string
+}
 
+const rrTemplate = `{{define "PREAMBLE"}}
+
+{{header}}
 package {{package}}
 
 import (
@@ -46,6 +93,28 @@ var _ = json.Marshal
 var _ = fmt.Printf
 var _ = rdl.BaseTypeAny
 var _ = ioutil.NopCloser
+{{end}}
+
+{{define "HANDLER_BASE"}}
+
+type {{handler}} interface {
+{{range methods}}
+   {{comment .Comment}}
+   {{.Signature}}{{end}}
+}
+
+type {{handler}}Authorizor func(action string, resource string, principal rdl.Principal) (bool, error)
+type {{handler}}Authenticator func(ctx context.Context, req *http.Request, w http.ResponseWriter) (context.Context, error)
+
+type {{handler}}Options struct {
+   BaseURL string
+   Authorizer {{handler}}Authorizor
+   Authenticator {{handler}}Authenticator
+}
+
+{{end}}
+
+{{define "CLIENT_BASE"}}
 
 type {{client}} struct {
 	URL         string
@@ -300,6 +369,14 @@ func encodeParams(objs ...string) string {
 	}
 	return "?" + s[1:]
 }
+{{end}}
+{{define "FILE"}}
+{{template "PREAMBLE"}}
+{{if generateHandler}}
+{{template "HANDLER_BASE"}}{{end}}
+{{if generateClient}}
+{{template "CLIENT_BASE"}}{{end}}
+
 {{range methods}}
 type {{.RequestName}} struct {
 {{range .Inputs}}   {{.Name}} {{.TypeName}}
@@ -311,6 +388,7 @@ type {{.ResponseName}} struct {
 {{end}}
 }
 
+{{if generateClient}}
 func (client {{client}}) {{.Signature}} {
 	var response {{.ResponseName}}
 	var headers map[string]string
@@ -342,11 +420,13 @@ func (client {{client}}) {{.Signature}} {
    }
    {{.ParseOutputHeaders}}
    return &response, nil
-	//end loop
 }
+{{end}}
+
+{{end}}
 {{end}}`
 
-func (gen *reqRepClientGenerator) emitClient() error {
+func (gen *reqRepGenerator) emitCode(client, handler bool) error {
 	commentFun := func(s string) string {
 		return formatComment(s, 0, 80)
 	}
@@ -361,23 +441,26 @@ func (gen *reqRepClientGenerator) emitClient() error {
 	methodFunc := func() []*reqRepMethod {
 		output := make([]*reqRepMethod, 0, len(gen.schema.Resources))
 		for _, r := range gen.schema.Resources {
-			output = append(output, gen.convertResource(gen.registry, r, gen.precise))
+			output = append(output, gen.convertResource(gen.registry, r))
 		}
 		return output
 	}
 
 	funcMap := template.FuncMap{
-		"rdlruntime": func() string { return gen.librdl },
-		"header":     func() string { return generationHeader(gen.banner) },
-		"package":    func() string { return generationPackage(gen.schema, gen.ns) },
-		"basename":   basenameFunc,
-		"comment":    commentFun,
-		"methods":    methodFunc,
-		"client":     func() string { return gen.name + "Client" },
+		"rdlruntime":      func() string { return gen.librdl },
+		"header":          func() string { return generationHeader(gen.banner) },
+		"package":         func() string { return generationPackage(gen.schema, gen.ns) },
+		"basename":        basenameFunc,
+		"comment":         commentFun,
+		"methods":         methodFunc,
+		"generateClient":  func() bool { return client },
+		"generateHandler": func() bool { return handler },
+		"client":          func() string { return gen.name + "Client" },
+		"handler":         func() string { return gen.name + "Handler" },
 	}
-	t := template.Must(template.New("REQREP_CLIENT_TEMPLATE").Funcs(funcMap).Parse(rrClientTemplate))
+	t := template.Must(template.New("REQREP_RPC_TEMPLATE").Funcs(funcMap).Parse(rrTemplate))
 	var output bytes.Buffer
-	if err := t.Execute(gen.writer, gen.schema); err != nil {
+	if err := t.ExecuteTemplate(gen.writer, "FILE", gen.schema); err != nil {
 		return err
 	} else if data, err := format.Source(output.Bytes()); err != nil {
 		return err
@@ -537,7 +620,7 @@ func (m *reqRepMethod) ParseOutputHeaders() (string, error) {
 	return code.CodeString()
 }
 
-func (rr *reqRepClientGenerator) convertInput(reg rdl.TypeRegistry, v *rdl.ResourceInput, precise bool) *reqRepVar {
+func (rr *reqRepGenerator) convertInput(reg rdl.TypeRegistry, v *rdl.ResourceInput) *reqRepVar {
 	if v.Context != "" { //legacy field, to be removed
 		return nil
 	}
@@ -547,7 +630,7 @@ func (rr *reqRepClientGenerator) convertInput(reg rdl.TypeRegistry, v *rdl.Resou
 		QueryParameter: v.QueryParam,
 		PathParameter:  v.PathParam,
 		Header:         v.Header,
-		TypeName:       goType2(reg, v.Type, v.Optional, "", "", precise, true, ""),
+		TypeName:       goType2(reg, v.Type, v.Optional, "", "", true, true, ""),
 	}
 	valueExpr := fmt.Sprintf("req.%s", res.Name)
 	if reg.IsArrayTypeName(v.Type) && res.QueryParameter != "" {
@@ -570,21 +653,21 @@ func (rr *reqRepClientGenerator) convertInput(reg rdl.TypeRegistry, v *rdl.Resou
 	return res
 }
 
-func (rr *reqRepClientGenerator) convertOutput(reg rdl.TypeRegistry, v *rdl.ResourceOutput, precise bool) *reqRepVar {
+func (rr *reqRepGenerator) convertOutput(reg rdl.TypeRegistry, v *rdl.ResourceOutput) *reqRepVar {
 	return &reqRepVar{
 		Name:      capitalize(goName(string(v.Name))),
 		Header:    v.Header,
 		Comment:   v.Comment,
 		ArrayType: reg.IsArrayTypeName(v.Type),
-		TypeName:  goType2(reg, v.Type, v.Optional, "", "", precise, true, ""),
+		TypeName:  goType2(reg, v.Type, v.Optional, "", "", true, true, ""),
 	}
 }
 
-func (rr *reqRepClientGenerator) convertResource(reg rdl.TypeRegistry, r *rdl.Resource, precise bool) *reqRepMethod {
+func (rr *reqRepGenerator) convertResource(reg rdl.TypeRegistry, r *rdl.Resource) *reqRepMethod {
 	var method reqRepMethod
 	bodyType := string(safeTypeVarName(r.Type))
 	for _, v := range r.Inputs {
-		if input := rr.convertInput(reg, v, precise); input != nil {
+		if input := rr.convertInput(reg, v); input != nil {
 			method.Inputs = append(method.Inputs, input)
 			if input.IsBody() {
 				bodyType = input.TypeName
@@ -595,11 +678,11 @@ func (rr *reqRepClientGenerator) convertResource(reg rdl.TypeRegistry, r *rdl.Re
 	if !noContent {
 		method.Outputs = append(method.Outputs, &reqRepVar{
 			Name:     "Body",
-			TypeName: goType(reg, r.Type, false, "", "", precise, true),
+			TypeName: goType(reg, r.Type, false, "", "", true, true),
 		})
 	}
 	for _, v := range r.Outputs {
-		if input := rr.convertOutput(reg, v, precise); input != nil {
+		if input := rr.convertOutput(reg, v); input != nil {
 			method.Inputs = append(method.Inputs, input)
 		}
 	}
