@@ -87,6 +87,10 @@ import (
 	"strings"
 	"time"
 	"context"
+{{if generateHandler}}
+	"github.com/dimfeld/httptreemux"
+	"log"
+{{end}}
 )
 
 var _ = json.Marshal
@@ -103,13 +107,49 @@ type {{handler}} interface {
    {{.Signature}}{{end}}
 }
 
-type {{handler}}Authorizor func(action string, resource string, principal rdl.Principal) (bool, error)
-type {{handler}}Authenticator func(ctx context.Context, req *http.Request, w http.ResponseWriter) (context.Context, error)
+type {{handler}}Authorizor func(ctx context.Context, action string, resource string) (bool, error)
+type {{handler}}Authenticator func(req *http.Request) (*http.Request, error)
 
 type {{handler}}Options struct {
-   BaseURL string
-   Authorizer {{handler}}Authorizor
-   Authenticator {{handler}}Authenticator
+   BaseURL         string
+   Authorizer      {{handler}}Authorizor
+   Authenticator   {{handler}}Authenticator
+}
+
+type {{adaptor}} struct {
+   opts *{{handler}}Options
+   handler {{handler}}
+}
+
+func NewAdaptor(handler {{handler}}, opts *{{handler}}Options) http.Handler {
+   baseURL := opts.BaseURL
+	for strings.HasSuffix(baseURL, "/") {
+		baseURL = baseURL[0 : len(baseURL)-1]
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	b := u.Path
+	router := httptreemux.New()
+	adaptor := &{{adaptor}}{opts : opts, handler : handler}
+{{range methods}}
+   	router.{{.Method}}(b+"{{.PathTemplate}}", adaptor.{{.AdaptorMethod}})
+   {{- end}}
+	router.NotFoundHandler = func(w http.ResponseWriter, r *http.Request) {
+		rdl.JSONResponse(w, 404, rdl.ResourceError{Code: http.StatusNotFound, Message: "Not Found"})
+	}
+	log.Printf("Initialized Callbackd service at '%s'\n", baseURL)
+	return router
+}
+
+func (adaptor *{{adaptor}}) sendErrorResponse(err error, w http.ResponseWriter) {
+	switch e := err.(type) {
+	case *rdl.ResourceError:
+		rdl.JSONResponse(w, e.Code, err)
+	default:
+		rdl.JSONResponse(w, 500, &rdl.ResourceError{Code: 500, Message: e.Error()})
+	}
 }
 
 {{end}}
@@ -387,7 +427,29 @@ type {{.ResponseName}} struct {
 {{range .Outputs}}   {{.Name}} {{.TypeName}}
 {{end}}
 }
+{{if generateHandler}}
+func (adaptor *{{adaptor}}) parse{{.Name}}(req *http.Request) (*{{.RequestName}}, error) {
 
+}
+
+func (adaptor *{{adaptor}}) {{.AdaptorMethod}}(w http.ResponseWriter, req *http.Request, ps map[string]string) {
+    // handle authentication
+    if authReq, err := adaptor.opts.Authenticator(req); err != nil {
+       adaptor.sendErrorResponse(err, w)
+    } else if parsedRequest, err := adaptor.parse{{.Name}}(authReq); err != nil {
+       adaptor.sendErrorResponse(err, w)
+    } else {
+        // handle authorization
+        resp, err := adaptor.handler.{{.Name}}(authReq.Context(), parsedRequest)
+        if err != nil {
+           adaptor.sendErrorResponse(err, w)
+        } else {
+           // send response object as HTTP
+
+        }
+    }
+}
+{{end}}
 {{if generateClient}}
 func (client {{client}}) {{.Signature}} {
 	var response {{.ResponseName}}
@@ -457,6 +519,7 @@ func (gen *reqRepGenerator) emitCode(client, handler bool) error {
 		"generateHandler": func() bool { return handler },
 		"client":          func() string { return gen.name + "Client" },
 		"handler":         func() string { return gen.name + "Handler" },
+		"adaptor":           func() string { return gen.name + "Adaptor" },
 	}
 	t := template.Must(template.New("REQREP_RPC_TEMPLATE").Funcs(funcMap).Parse(rrTemplate))
 	var output bytes.Buffer
@@ -490,6 +553,8 @@ type reqRepMethod struct {
 	Resource        *rdl.Resource
 	Name            string
 	Method          string
+	AdaptorMethod   string
+	PathTemplate    string
 	PathExpression  []string
 	QueryExpression []string
 	Comment         string
@@ -699,6 +764,7 @@ func (rr *reqRepGenerator) convertResource(reg rdl.TypeRegistry, r *rdl.Resource
 	} else {
 		method.Name = capitalize(method.Name)
 	}
+	method.AdaptorMethod = strings.ToLower(method.Name[:1]) + method.Name[1:]
 	method.RequestName = method.Name + "Request"
 	method.ResponseName = method.Name + "Response"
 	findPathVariable := func(name string) *reqRepVar {
@@ -714,6 +780,7 @@ func (rr *reqRepGenerator) convertResource(reg rdl.TypeRegistry, r *rdl.Resource
 			return
 		}
 		method.PathExpression = append(method.PathExpression, fmt.Sprintf("%#v", s))
+		method.PathTemplate += s
 	}
 	addPathVariable := func(name string) {
 		v := findPathVariable(name)
@@ -722,6 +789,7 @@ func (rr *reqRepGenerator) convertResource(reg rdl.TypeRegistry, r *rdl.Resource
 			return
 		}
 		method.PathExpression = append(method.PathExpression, fmt.Sprintf("req.%s", v.Name))
+		method.PathTemplate += ":" + strings.ToLower(v.Name)
 	}
 	addQueryParameter := func(v *reqRepVar) {
 		method.QueryExpression = append(method.QueryExpression, v.EncodeParameterExpression)
