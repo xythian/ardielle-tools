@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/ardielle/ardielle-go/rdl"
 	"go/format"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -423,20 +424,31 @@ type {{.RequestName}} struct {
 {{end}}
 }
 
+func Parse{{.RequestName}}(req *http.Request) (*{{.RequestName}}, error) {
+    var req {{.RequestName}}
+    var err error
+{{range .Inputs }}
+    {{.DecodeInputBlock}}
+{{- end}}
+    return &req, nil
+}
+
 type {{.ResponseName}} struct {
 {{range .Outputs}}   {{.Name}} {{.TypeName}}
 {{end}}
 }
-{{if generateHandler}}
-func (adaptor *{{adaptor}}) parse{{.Name}}(req *http.Request) (*{{.RequestName}}, error) {
+
+func (resp *{{.ResponseName}}) WriteResponse(w http.ResponseWriter, req *http.Request) {
 
 }
+
+{{if generateHandler}}
 
 func (adaptor *{{adaptor}}) {{.AdaptorMethod}}(w http.ResponseWriter, req *http.Request, ps map[string]string) {
     // handle authentication
     if authReq, err := adaptor.opts.Authenticator(req); err != nil {
        adaptor.sendErrorResponse(err, w)
-    } else if parsedRequest, err := adaptor.parse{{.Name}}(authReq); err != nil {
+    } else if parsedRequest, err := Parse{{.RequestName}}(authReq); err != nil {
        adaptor.sendErrorResponse(err, w)
     } else {
         // handle authorization
@@ -445,7 +457,7 @@ func (adaptor *{{adaptor}}) {{.AdaptorMethod}}(w http.ResponseWriter, req *http.
            adaptor.sendErrorResponse(err, w)
         } else {
            // send response object as HTTP
-
+			  resp.WriteResponse(w, req)
         }
     }
 }
@@ -519,7 +531,7 @@ func (gen *reqRepGenerator) emitCode(client, handler bool) error {
 		"generateHandler": func() bool { return handler },
 		"client":          func() string { return gen.name + "Client" },
 		"handler":         func() string { return gen.name + "Handler" },
-		"adaptor":           func() string { return gen.name + "Adaptor" },
+		"adaptor":         func() string { return gen.name + "Adaptor" },
 	}
 	t := template.Must(template.New("REQREP_RPC_TEMPLATE").Funcs(funcMap).Parse(rrTemplate))
 	var output bytes.Buffer
@@ -539,6 +551,7 @@ type reqRepVar struct {
 	TypeName                  string
 	ArrayType                 bool
 	EncodeParameterExpression string
+	DecodeInputBlock          string
 	QueryParameter            string
 	PathParameter             bool
 	Header                    string
@@ -685,6 +698,97 @@ func (m *reqRepMethod) ParseOutputHeaders() (string, error) {
 	return code.CodeString()
 }
 
+func (m *reqRepMethod) goParamInitBlock(reg rdl.TypeRegistry, qname string, pname string, ptype rdl.TypeRef, pdefault interface{}, poptional bool, precise bool, prefixEnums bool) string {
+	s := ""
+	switch gtype {
+	default:
+		t := reg.FindType(ptype)
+		bt := reg.BaseType(t)
+		switch bt {
+		case rdl.BaseTypeString:
+			if pdefault == nil {
+				if precise && gtype != "string" {
+					s += "\t" + pname + " := " + gtype + "(rdl.OptionalStringParam(request, \"" + qname + "\"))\n"
+				} else {
+					s += "\t" + pname + " := rdl.OptionalStringParam(request, \"" + qname + "\")\n"
+				}
+			} else {
+				def := fmt.Sprintf("%q", pdefault)
+				if precise && gtype != "string" {
+					s += "\t" + pname + "Val, _ := rdl.StringParam(request, \"" + qname + "\", " + def + ")\n"
+					s += "\t" + pname + " := " + gtype + "(" + pname + "Val)\n"
+				} else {
+					s += "\t" + pname + ", _ := rdl.StringParam(request, \"" + qname + "\", " + def + ")\n"
+				}
+			}
+		case rdl.BaseTypeInt32, rdl.BaseTypeInt16, rdl.BaseTypeInt8, rdl.BaseTypeInt64, rdl.BaseTypeFloat32, rdl.BaseTypeFloat64:
+			stype := fmt.Sprint(bt)
+			if pdefault == nil {
+				s += "\t" + pname + ", err := rdl.Optional" + stype + "Param(request, \"" + qname + "\")\n" //!
+				s += "\tif err != nil {\n\t\trdl.JSONResponse(writer, 400, err)\n\t\treturn\n\t}\n"
+			} else {
+				def := "0"
+				switch v := pdefault.(type) {
+				case float64:
+					def = fmt.Sprintf("%v", v)
+				default:
+					fmt.Println("fix me:", pdefault)
+					panic("fix me")
+				}
+				if precise {
+					s += "\t" + pname + "_, err := rdl." + stype + "Param(request, \"" + qname + "\", " + def + ")\n"
+				} else {
+					s += "\t" + pname + ", err := rdl." + stype + "Param(request, \"" + qname + "\", " + def + ")\n"
+				}
+				s += "\tif err != nil {\n\t\trdl.JSONResponse(writer, 400, err)\n\t\treturn\n\t}\n"
+				if precise {
+					s += "\t" + pname + " := " + gtype + "(" + pname + "_)\n"
+				}
+			}
+		case rdl.BaseTypeBool:
+			if pdefault == nil {
+				s += "\t" + pname + ", err := rdl.OptionalBoolParam(request, \"" + qname + "\")\n"
+				s += "\tif err != nil {\n"
+				s += "\t\trdl.JSONResponse(writer, 400, err)\n"
+				s += "\t\treturn\n"
+				s += "\t}\n"
+			} else {
+				def := fmt.Sprintf("%v", pdefault)
+				s += "\tvar " + pname + "Optional " + gtype + " = " + def + "\n"
+				s += "\t" + pname + ", err := rdl.BoolParam(request, \"" + qname + "\", " + pname + "Optional)\n"
+				s += "\tif err != nil {\n"
+				s += "\t\trdl.JSONResponse(writer, 400, err)\n"
+				s += "\t\treturn\n"
+				s += "\t}\n"
+			}
+		case rdl.BaseTypeEnum:
+			if pdefault == nil {
+				s += fmt.Sprintf("\tvar %s *%s\n", pname, gtype)
+				s += fmt.Sprintf("\t%sOptional := rdl.OptionalStringParam(request, %q)\n", pname, qname)
+				s += fmt.Sprintf("\tif %sOptional != \"\" {\n", pname)
+				s += "\t\tp" + pname + " := New" + gtype + "(" + pname + "Optional)\n"
+				s += "\t\t" + pname + " = &p" + pname + "\n"
+				s += "\t}\n"
+			} else {
+				if prefixEnums {
+					pdefault = gtype + SnakeToCamel(fmt.Sprint(pdefault))
+				}
+				s += fmt.Sprintf("\t%sOptional, _ := rdl.StringParam(request, %q, %v.String())\n", pname, qname, pdefault)
+				if poptional {
+					s += "\tp" + pname + " := New" + gtype + "(" + pname + "Optional)\n"
+					s += "\t" + pname + " := &p" + pname + "\n"
+				} else {
+					s += "\t" + pname + " := New" + gtype + "(" + pname + "Optional)\n"
+				}
+			}
+		default:
+			fmt.Println("fix me:", pname, "of type", gtype, "with base type", bt)
+			panic("fix me")
+		}
+	}
+	return s
+}
+
 func (rr *reqRepGenerator) convertInput(reg rdl.TypeRegistry, v *rdl.ResourceInput) *reqRepVar {
 	if v.Context != "" { //legacy field, to be removed
 		return nil
@@ -697,9 +801,19 @@ func (rr *reqRepGenerator) convertInput(reg rdl.TypeRegistry, v *rdl.ResourceInp
 		Header:         v.Header,
 		TypeName:       goType2(reg, v.Type, v.Optional, "", "", true, true, ""),
 	}
+	var decoder codeGen
 	valueExpr := fmt.Sprintf("req.%s", res.Name)
+	baseType := reg.BaseTypeName(v.Type)
+	if v.Optional {
+		if v.Default != nil {
+			decoder.Println("%s = %s", valueExpr, goLiteral(v.Default, baseType))
+		}
+	}
 	if reg.IsArrayTypeName(v.Type) && res.QueryParameter != "" {
 		res.EncodeParameterExpression = fmt.Sprintf("encodeListParam(\"%s\", %s)", res.QueryParameter, valueExpr)
+		decoder.Printf("if %s, err = decodeListParam(\"%s\") {", valueExpr, res.QueryParameter)
+		decoder.Println("   return nil, err")
+		decoder.Println("}")
 	} else if res.QueryParameter != "" {
 		baseType := reg.BaseTypeName(v.Type)
 		if v.Optional && baseType != "String" {
@@ -714,7 +828,7 @@ func (rr *reqRepGenerator) convertInput(reg rdl.TypeRegistry, v *rdl.ResourceInp
 			}
 		}
 	}
-
+	res.DecodeInputBlock, _ = decoder.CodeString()
 	return res
 }
 
